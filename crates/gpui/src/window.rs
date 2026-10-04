@@ -1831,7 +1831,13 @@ impl Window {
                 // after this frame (the window was re-invalidated mid-draw, or
                 // animations scheduled next-frame callbacks), re-arm the frame
                 // source explicitly.
-                if invalidator.is_dirty() || !next_frame_callbacks.borrow().is_empty() {
+                // While input arrives at a high rate, the frames presented to
+                // keep the display at full refresh are demand too, although
+                // nothing is dirty.
+                if invalidator.is_dirty()
+                    || !next_frame_callbacks.borrow().is_empty()
+                    || input_rate_tracker.borrow_mut().is_high_rate()
+                {
                     invalidator.wake_platform();
                 }
             }

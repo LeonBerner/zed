@@ -74,7 +74,7 @@ use std::{
     ptr::{self, NonNull},
     rc::Rc,
     sync::{
-        Arc, Once, Weak,
+        Arc, Once, OnceLock, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -665,6 +665,9 @@ struct MacWindowState {
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
+    frame_demand: Arc<FrameDemand>,
+    /// Display link ticks since gpui last asked for a frame.
+    idle_ticks: u32,
     renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
@@ -847,16 +850,25 @@ impl MacWindowState {
             return;
         };
         let data = self.native_view.as_ptr() as *mut c_void;
-        self.frame_source
+        let started = self
+            .frame_source
             .get_or_insert_with(|| WindowFrameSource::new(data, step))
             .start(display_id)
-            .log_err();
+            .log_err()
+            .is_some();
+        self.idle_ticks = 0;
+        self.frame_demand
+            .link_running
+            .store(started, Ordering::Relaxed);
     }
 
     fn stop_display_link(&mut self) {
         if let Some(frame_source) = self.frame_source.as_mut() {
             frame_source.stop();
         }
+        self.frame_demand
+            .link_running
+            .store(false, Ordering::Relaxed);
     }
 
     fn is_maximized(&self) -> bool {
@@ -953,7 +965,74 @@ impl MacWindowState {
 
 unsafe impl Send for MacWindowState {}
 
-pub(crate) struct MacWindow(Arc<Mutex<MacWindowState>>, MainThreadMarker);
+pub(crate) struct MacWindow(
+    Arc<Mutex<MacWindowState>>,
+    MainThreadMarker,
+    Arc<FrameDemand>,
+);
+
+/// How many display link ticks a window lets pass without frame demand
+/// before it stops listening to the link. A few ticks, not a time span: a
+/// span longer than the 500 ms cursor blink would keep the link running for
+/// as long as a cursor blinks.
+const IDLE_TICKS_BEFORE_STOP: u32 = 3;
+
+/// Whether gpui wants frames for a window, so that the window's display link
+/// subscription can stop while the window is visible but has nothing to draw
+/// and start again on demand.
+///
+/// Only touched on the main thread. The flags are atomics so that
+/// [`FrameDemand::request`], which gpui calls while it marks a window dirty,
+/// never needs the window lock.
+#[derive(Default)]
+struct FrameDemand {
+    /// Set when gpui asks for a frame, cleared by each display link tick.
+    demanded: AtomicBool,
+    /// Whether the window is subscribed to its display's link.
+    link_running: AtomicBool,
+    /// Whether a wake is already queued on the main thread.
+    wake_pending: AtomicBool,
+    window: OnceLock<Weak<Mutex<MacWindowState>>>,
+}
+
+impl FrameDemand {
+    fn request(self: &Arc<Self>) {
+        self.demanded.store(true, Ordering::Relaxed);
+        if self.link_running.load(Ordering::Relaxed)
+            || self.wake_pending.swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        let context = Arc::into_raw(self.clone()) as *mut c_void;
+        unsafe {
+            DispatchQueue::main().exec_async_f(context, wake_frame_source);
+        }
+    }
+}
+
+/// Restarts a stopped display link subscription and draws a frame right
+/// away, so input after an idle spell isn't held back until the link's
+/// first tick.
+extern "C" fn wake_frame_source(context: *mut c_void) {
+    let demand = unsafe { Arc::from_raw(context as *const FrameDemand) };
+    demand.wake_pending.store(false, Ordering::Relaxed);
+    let Some(window_state) = demand.window.get().and_then(Weak::upgrade) else {
+        return;
+    };
+    let mut lock = window_state.lock();
+    lock.start_display_link();
+    if !demand.link_running.load(Ordering::Relaxed) {
+        // The window isn't visible. The demand stays set, and the link
+        // starts again when the window's occlusion state changes.
+        return;
+    }
+    if let Some(mut callback) = lock.request_frame_callback.take() {
+        demand.demanded.store(false, Ordering::Relaxed);
+        drop(lock);
+        callback(Default::default());
+        window_state.lock().request_frame_callback = Some(callback);
+    }
+}
 
 impl MacWindow {
     pub fn open(
@@ -1098,6 +1177,8 @@ impl MacWindow {
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
                 frame_source: None,
+                frame_demand: Arc::new(FrameDemand::default()),
+                idle_ticks: 0,
                 renderer: renderer::new_renderer(
                     renderer_context,
                     native_window as *mut _,
@@ -1146,7 +1227,9 @@ impl MacWindow {
                 accesskit_adapter: None,
                 sheet_parent: None,
             }));
-            let mut window = Self(state, marker);
+            let frame_demand = state.lock().frame_demand.clone();
+            frame_demand.window.set(Arc::downgrade(&state)).ok();
+            let mut window = Self(state, marker, frame_demand);
 
             (*native_window).set_ivar(
                 WINDOW_STATE_IVAR,
@@ -2009,6 +2092,15 @@ impl PlatformWindow for MacWindow {
                 .styleMask()
                 .contains(NSWindowStyleMask::NSFullScreenWindowMask)
         }
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let demand = self.2.clone();
+        Some(Rc::new(move || demand.request()))
+    }
+
+    fn schedule_frame(&self) {
+        self.2.request();
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
@@ -3303,6 +3395,17 @@ extern "C" fn step(view: *mut c_void) {
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();
+
+    if lock.frame_demand.demanded.swap(false, Ordering::Relaxed) {
+        lock.idle_ticks = 0;
+    } else {
+        lock.idle_ticks += 1;
+        if lock.idle_ticks > IDLE_TICKS_BEFORE_STOP {
+            // Nothing to draw: stop ticking until gpui asks for a frame.
+            lock.stop_display_link();
+            return;
+        }
+    }
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
         drop(lock);
