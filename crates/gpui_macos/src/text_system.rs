@@ -71,6 +71,11 @@ struct MacTextSystemState {
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
+    /// Each font at each size `layout_line` has set it at, by the size's
+    /// bits. A new copy for every run would start CoreText's per-font caches
+    /// over each line, and building them is costly for a variable font such
+    /// as the system UI font.
+    sized_fonts: HashMap<(FontId, u32), CTFont>,
 }
 
 impl MacTextSystem {
@@ -84,6 +89,7 @@ impl MacTextSystem {
             font_ids_by_postscript_name: HashMap::default(),
             font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
+            sized_fonts: HashMap::default(),
         }))
     }
 }
@@ -561,12 +567,12 @@ impl MacTextSystemState {
                 } else {
                     font_size
                 };
+                let sized_font = self
+                    .sized_fonts
+                    .entry((run.font_id, f32::from(font_size).to_bits()))
+                    .or_insert_with(|| font.native_font().clone_with_font_size(font_size.into()));
                 unsafe {
-                    string.set_attribute(
-                        cf_range,
-                        kCTFontAttributeName,
-                        &font.native_font().clone_with_font_size(font_size.into()),
-                    );
+                    string.set_attribute(cf_range, kCTFontAttributeName, &*sized_font);
                 }
                 break_ligature = !break_ligature;
             }
