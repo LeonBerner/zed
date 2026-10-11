@@ -1163,6 +1163,14 @@ pub struct Window {
     is_resizable: bool,
     is_minimizable: bool,
     sprite_atlas: Arc<dyn PlatformAtlas>,
+    /// Each glyph painted so far, with its raster bounds and its tile, if
+    /// it has pixels. Saves locking the text system and the atlas for each
+    /// glyph of each frame. Dropped when the atlas drops its tiles.
+    glyph_tiles: FxHashMap<RenderGlyphParams, Option<(Bounds<DevicePixels>, AtlasTile)>>,
+    /// The atlas's `clears` when `glyph_tiles` was last emptied.
+    glyph_tiles_clears: u64,
+    /// The last color a glyph was painted in, and its dilation.
+    glyph_dilation: Option<(Hsla, u8)>,
     text_system: Arc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
@@ -2033,6 +2041,9 @@ impl Window {
             is_resizable,
             is_minimizable,
             sprite_atlas,
+            glyph_tiles: FxHashMap::default(),
+            glyph_tiles_clears: 0,
+            glyph_dilation: None,
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
             rem_size: px(16.),
@@ -3271,6 +3282,12 @@ impl Window {
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
         let arena_scope = ElementArenaScope::enter(&cx.element_arena);
+
+        let atlas_clears = self.sprite_atlas.clears();
+        if atlas_clears != self.glyph_tiles_clears {
+            self.glyph_tiles.clear();
+            self.glyph_tiles_clears = atlas_clears;
+        }
 
         if self.platform_window.prepare_frame() {
             self.refresh();
@@ -4668,7 +4685,14 @@ impl Window {
         );
         let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
         let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
-        let dilation = self.text_system().glyph_dilation_for_color(color);
+        let dilation = match self.glyph_dilation {
+            Some((last, dilation)) if last == color => dilation,
+            _ => {
+                let dilation = self.text_system().glyph_dilation_for_color(color);
+                self.glyph_dilation = Some((color, dilation));
+                dilation
+            }
+        };
         let params = RenderGlyphParams {
             font_id,
             glyph_id,
@@ -4680,15 +4704,27 @@ impl Window {
             dilation,
         };
 
-        let raster_bounds = self.text_system().raster_bounds(&params)?;
-        if !raster_bounds.is_zero() {
-            let tile = self
-                .sprite_atlas
-                .get_or_insert_with(params.clone().into(), &mut || {
-                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
-                    Ok(Some((size, Cow::Owned(bytes))))
-                })?
-                .expect("Callback above only errors or returns Some");
+        let tiled = match self.glyph_tiles.get(&params) {
+            Some(tiled) => *tiled,
+            None => {
+                let raster_bounds = self.text_system().raster_bounds(&params)?;
+                let tiled = if raster_bounds.is_zero() {
+                    None
+                } else {
+                    let tile = self
+                        .sprite_atlas
+                        .get_or_insert_with(params.clone().into(), &mut || {
+                            let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+                            Ok(Some((size, Cow::Owned(bytes))))
+                        })?
+                        .expect("Callback above only errors or returns Some");
+                    Some((raster_bounds, tile))
+                };
+                self.glyph_tiles.insert(params, tiled);
+                tiled
+            }
+        };
+        if let Some((raster_bounds, tile)) = tiled {
             let bounds = Bounds {
                 origin: integer_origin + raster_bounds.origin.map(Into::into),
                 size: tile.bounds.size.map(Into::into),
@@ -4721,11 +4757,13 @@ impl Window {
     }
 
     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
-        if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
+        // First, as it is the cheaper to ask on platforms that lock for the
+        // appearance.
+        if !self.platform_window.is_subpixel_rendering_supported() {
             return false;
         }
 
-        if !self.platform_window.is_subpixel_rendering_supported() {
+        if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
             return false;
         }
 

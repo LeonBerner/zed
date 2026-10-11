@@ -1432,6 +1432,12 @@ pub trait PlatformAtlas {
     ) -> Result<Option<AtlasTile>>;
     fn remove(&self, key: &AtlasKey);
 
+    /// How many times the atlas has dropped all its tiles, as after losing
+    /// its device, so a cache of its tiles knows to drop them too.
+    fn clears(&self) -> u64 {
+        0
+    }
+
     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn contains(&self, _key: &AtlasKey) -> bool {
         false
@@ -1453,6 +1459,7 @@ pub trait AtlasBackend {
 #[doc(hidden)]
 pub struct AtlasState<Backend> {
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
+    clears: u64,
     pub backend: Backend,
 }
 
@@ -1460,6 +1467,7 @@ impl<Backend> AtlasState<Backend> {
     pub fn new(backend: Backend) -> Self {
         Self {
             tiles_by_key: FxHashMap::default(),
+            clears: 0,
             backend,
         }
     }
@@ -1468,7 +1476,13 @@ impl<Backend> AtlasState<Backend> {
         self.tiles_by_key.contains_key(key)
     }
 
+    /// How many times `clear` has run.
+    pub fn clears(&self) -> u64 {
+        self.clears
+    }
+
     pub fn clear(&mut self, reset_backend: impl FnOnce(&mut Backend)) {
+        self.clears += 1;
         self.tiles_by_key.clear();
         reset_backend(&mut self.backend);
     }

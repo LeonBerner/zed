@@ -111,6 +111,10 @@ impl WgpuAtlas {
 }
 
 impl PlatformAtlas for WgpuAtlas {
+    fn clears(&self) -> u64 {
+        self.0.lock().clears()
+    }
+
     fn get_or_insert_with<'a>(
         &self,
         key: AtlasKey,
