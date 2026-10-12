@@ -22,7 +22,7 @@ use cocoa::{
         NSUserDefaults,
     },
 };
-use dispatch2::DispatchQueue;
+use dispatch2::{DispatchQueue, DispatchTime};
 use gpui::{
     AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalDragPayload,
     ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers,
@@ -75,7 +75,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Once, OnceLock, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -860,6 +860,7 @@ impl MacWindowState {
         self.frame_demand
             .link_running
             .store(started, Ordering::Relaxed);
+        self.frame_demand.drawing_ticks.store(0, Ordering::Relaxed);
     }
 
     fn stop_display_link(&mut self) {
@@ -990,29 +991,110 @@ struct FrameDemand {
     demanded: AtomicBool,
     /// Whether the window is subscribed to its display's link.
     link_running: AtomicBool,
+    /// When the window last drew a frame, in nanoseconds since
+    /// [`frame_clock`] started.
+    last_frame: AtomicU64,
+    /// The time between the link's ticks, in nanoseconds, once known.
+    refresh: AtomicU64,
+    /// When the link last ticked, in nanoseconds since [`frame_clock`]
+    /// started.
+    last_tick: AtomicU64,
+    /// How many ticks in a row have drawn a frame. From the second, as
+    /// while scrolling, each next frame waits for the next tick, so frames
+    /// keep to the display's refresh.
+    drawing_ticks: AtomicU32,
     /// Whether a wake is already queued on the main thread.
     wake_pending: AtomicBool,
     window: OnceLock<Weak<Mutex<MacWindowState>>>,
 }
 
+/// The time between refreshes until the link has ticked twice in a row:
+/// 120 Hz.
+const DEFAULT_REFRESH_NANOS: u64 = 8_333_333;
+
+/// Times between two ticks that can be a refresh: about 30 to 250 Hz. A longer
+/// one spans a stop of the link.
+const REFRESH_NANOS: std::ops::RangeInclusive<u64> = 4_000_000..=34_000_000;
+
+/// Ticks in a row that draw a frame before frames keep to the ticks.
+const STEADY_TICKS: u32 = 2;
+
+/// Nanoseconds since the first call, for frame pacing.
+fn frame_clock() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos() as u64
+}
+
 impl FrameDemand {
+    /// Asks for a frame. A stopped link starts, and the frame is drawn at
+    /// once. On a running link that isn't drawing at every tick, it is drawn
+    /// as soon as a refresh has passed since the last frame, rather than at
+    /// the link's next tick: the link takes a few refreshes to tick after it
+    /// starts, and a frame asked for between ticks, as when a task's result
+    /// comes in, would otherwise wait up to a refresh more.
     fn request(self: &Arc<Self>) {
         self.demanded.store(true, Ordering::Relaxed);
         if self.link_running.load(Ordering::Relaxed)
-            || self.wake_pending.swap(true, Ordering::Relaxed)
+            && self.drawing_ticks.load(Ordering::Relaxed) >= STEADY_TICKS
         {
             return;
         }
+        if self.wake_pending.swap(true, Ordering::Relaxed) {
+            return;
+        }
         let context = Arc::into_raw(self.clone()) as *mut c_void;
+        let wait = if self.link_running.load(Ordering::Relaxed) {
+            let since = frame_clock().saturating_sub(self.last_frame.load(Ordering::Relaxed));
+            self.refresh_nanos().saturating_sub(since)
+        } else {
+            0
+        };
         unsafe {
-            DispatchQueue::main().exec_async_f(context, wake_frame_source);
+            if wait == 0 {
+                DispatchQueue::main().exec_async_f(context, wake_frame_source);
+            } else {
+                let when = DispatchTime::NOW.time(wait as i64);
+                DispatchQueue::exec_after_f(
+                    when,
+                    DispatchQueue::main(),
+                    context,
+                    wake_frame_source,
+                );
+            }
+        }
+    }
+
+    fn refresh_nanos(&self) -> u64 {
+        match self.refresh.load(Ordering::Relaxed) {
+            0 => DEFAULT_REFRESH_NANOS,
+            refresh => refresh,
+        }
+    }
+
+    /// Notes a tick of the link, and whether it draws a frame.
+    fn ticked(&self, drawing: bool) {
+        let drawing_ticks = if drawing {
+            self.drawing_ticks.load(Ordering::Relaxed).saturating_add(1)
+        } else {
+            0
+        };
+        self.drawing_ticks.store(drawing_ticks, Ordering::Relaxed);
+        let now = frame_clock();
+        let since = now.saturating_sub(self.last_tick.swap(now, Ordering::Relaxed));
+        // Ticks in a row, not the first after the link started.
+        if REFRESH_NANOS.contains(&since) {
+            self.refresh.store(since, Ordering::Relaxed);
         }
     }
 }
 
 /// Restarts a stopped display link subscription and draws a frame right
 /// away, so input after an idle spell isn't held back until the link's
-/// first tick.
+/// first tick. On a running link, draws the frame asked for, unless a tick
+/// has drawn it since.
 extern "C" fn wake_frame_source(context: *mut c_void) {
     let demand = unsafe { Arc::from_raw(context as *const FrameDemand) };
     demand.wake_pending.store(false, Ordering::Relaxed);
@@ -1020,7 +1102,11 @@ extern "C" fn wake_frame_source(context: *mut c_void) {
         return;
     };
     let mut lock = window_state.lock();
-    lock.start_display_link();
+    if !demand.link_running.load(Ordering::Relaxed) {
+        lock.start_display_link();
+    } else if !demand.demanded.load(Ordering::Relaxed) {
+        return;
+    }
     if !demand.link_running.load(Ordering::Relaxed) {
         // The window isn't visible. The demand stays set, and the link
         // starts again when the window's occlusion state changes.
@@ -2205,6 +2291,7 @@ impl PlatformWindow for MacWindow {
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
         this.renderer.draw(scene);
+        self.2.last_frame.store(frame_clock(), Ordering::Relaxed);
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -3396,7 +3483,9 @@ extern "C" fn step(view: *mut c_void) {
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();
 
-    if lock.frame_demand.demanded.swap(false, Ordering::Relaxed) {
+    let demanded = lock.frame_demand.demanded.swap(false, Ordering::Relaxed);
+    lock.frame_demand.ticked(demanded);
+    if demanded {
         lock.idle_ticks = 0;
     } else {
         lock.idle_ticks += 1;
