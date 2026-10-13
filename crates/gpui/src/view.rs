@@ -559,6 +559,7 @@ fn paint_view(
                     let mut element_state = element_state.unwrap();
 
                     let paint_start = window.paint_index();
+                    window.next_frame.scene.start_recording();
 
                     if let Some(element) = element {
                         let refreshing = mem::replace(&mut window.refreshing, true);
@@ -568,6 +569,7 @@ fn paint_view(
                         window.reuse_paint(element_state.paint_range.clone());
                     }
 
+                    window.next_frame.scene.stop_recording();
                     let paint_end = window.paint_index();
                     element_state.paint_range = paint_start..paint_end;
 

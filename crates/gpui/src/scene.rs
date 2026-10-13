@@ -39,7 +39,14 @@ impl From<bool> for PaddedBool32 {
 #[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {
+    /// What was painted while recording, in order, for a cached view or a
+    /// deferred draw to replay on a later frame.
     pub(crate) paint_operations: Vec<PaintOperation>,
+    /// How many cached views and deferred draws are being painted, one inside
+    /// another. Only they are ever replayed, so nothing is recorded outside
+    /// them: copying every glyph into `paint_operations` cost a window full
+    /// of text a large part of its painting.
+    recording: usize,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
     pub shadows: Vec<Shadow>,
@@ -56,6 +63,7 @@ pub struct Scene {
 impl Scene {
     pub fn clear(&mut self) {
         self.paint_operations.clear();
+        self.recording = 0;
         self.primitive_bounds.clear();
         self.layer_stack.clear();
         self.paths.clear();
@@ -72,16 +80,30 @@ impl Scene {
         self.paint_operations.len()
     }
 
+    /// Records what is painted from now until the matching
+    /// [`Self::stop_recording`], for a later frame to replay.
+    pub(crate) fn start_recording(&mut self) {
+        self.recording += 1;
+    }
+
+    pub(crate) fn stop_recording(&mut self) {
+        self.recording -= 1;
+    }
+
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
         let order = self.primitive_bounds.insert(bounds);
         self.layer_stack.push(order);
-        self.paint_operations
-            .push(PaintOperation::StartLayer(bounds));
+        if self.recording > 0 {
+            self.paint_operations
+                .push(PaintOperation::StartLayer(bounds));
+        }
     }
 
     pub fn pop_layer(&mut self) {
         self.layer_stack.pop();
-        self.paint_operations.push(PaintOperation::EndLayer);
+        if self.recording > 0 {
+            self.paint_operations.push(PaintOperation::EndLayer);
+        }
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
@@ -134,8 +156,10 @@ impl Scene {
                 self.surfaces.push(surface.clone());
             }
         }
-        self.paint_operations
-            .push(PaintOperation::Primitive(primitive));
+        if self.recording > 0 {
+            self.paint_operations
+                .push(PaintOperation::Primitive(primitive));
+        }
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {

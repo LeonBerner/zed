@@ -3797,6 +3797,7 @@ impl Window {
                 .set_active_node(deferred_draw.parent_node);
 
             let paint_start = self.paint_index();
+            self.next_frame.scene.start_recording();
             let content_mask = deferred_draw.content_mask;
             if let Some(element) = deferred_draw.element.as_mut() {
                 self.with_rendered_view(deferred_draw.current_view, |window| {
@@ -3809,6 +3810,7 @@ impl Window {
             } else {
                 self.reuse_paint(deferred_draw.paint_range.clone());
             }
+            self.next_frame.scene.stop_recording();
             let paint_end = self.paint_index();
             deferred_draw.paint_range = paint_start..paint_end;
         }
@@ -9159,6 +9161,69 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    struct PaintRecordingRoot {
+        child: Option<crate::Entity<PaintRecordingChild>>,
+    }
+
+    impl Render for PaintRecordingRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let root = div().size_full().bg(hsla(0., 0., 0., 1.));
+            match &self.child {
+                Some(child) => root.child(
+                    child
+                        .clone()
+                        .cached(crate::StyleRefinement::default().size(px(100.))),
+                ),
+                None => root,
+            }
+        }
+    }
+
+    struct PaintRecordingChild;
+
+    impl Render for PaintRecordingChild {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(div().size(px(10.)).bg(hsla(0.5, 1., 0.5, 1.)))
+                .child(div().size(px(10.)).bg(hsla(0.7, 1., 0.5, 1.)))
+        }
+    }
+
+    /// A cached view that isn't redrawn is painted again from what it painted
+    /// last, and so again from that, frame after frame.
+    #[gpui::test]
+    fn test_cached_view_paint_is_replayed(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, cx| PaintRecordingRoot {
+            child: Some(cx.new(|_| PaintRecordingChild)),
+        });
+        cx.update_window(window.into(), |root, window, cx| {
+            window.draw(cx).clear(cx);
+            let quads = window.rendered_frame.scene.quads.len();
+            assert_eq!(quads, 3);
+            for _ in 0..2 {
+                // Only the root is redrawn: the child's paint is reused.
+                cx.notify(root.entity_id());
+                window.draw(cx).clear(cx);
+                assert_eq!(window.rendered_frame.scene.quads.len(), quads);
+            }
+        })
+        .unwrap();
+    }
+
+    /// What is painted outside any cached view can't be replayed, so the
+    /// scene keeps no record of it.
+    #[gpui::test]
+    fn test_paint_outside_cached_views_is_not_recorded(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| PaintRecordingRoot { child: None });
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(window.rendered_frame.scene.quads.len(), 1);
+            assert_eq!(window.rendered_frame.scene.paint_operations.len(), 0);
+        })
+        .unwrap();
     }
 }
 
